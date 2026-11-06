@@ -1618,142 +1618,6 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, str(e))
             return None
     
-def _fetch_em_hk_single_quote(code: str) -> dict:
-    """东方财富单股接口：补齐 ak.stock_hk_spot_em() 不返回的量比/换手率/PE/PB。
-
-    该接口返回的数值可能是放大 100 倍后的整数（如 30.38 -> 30380），
-    调用方需用最新价自校准缩放系数，不可假定固定倍数。
-    """
-    try:
-        resp = requests.get(
-            "https://push2.eastmoney.com/api/qt/stock/get",
-            params={
-                "secid": f"116.{code}",
-                "fields": "f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f162,f167,f168,f169,f170",
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                "invt": "2",
-            },
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return (resp.json() or {}).get("data") or {}
-    except Exception as exc:  # 网络失败不应影响主流程
-        logger.debug(f"[港股补充行情] {code} 获取失败: {exc}")
-        return {}
-
-
-def _build_quote_from_em_single(stock_code: str, code: str) -> Optional["UnifiedRealtimeQuote"]:
-    """用东方财富单股接口构造港股实时行情（单票 1 次请求，毫秒级）。
-
-    相比 ak.stock_hk_spot_em()（需拉全市场约 4743 只、实测耗时 127s 易超时），
-    该接口一次只取一只，是港股实时行情更合适的首选源。
-
-    字段单位（东财港股）：
-      - 价格类（最新/开/高/低/昨收/涨跌额）放大 1000 倍，如 30380 -> 30.38
-      - 比率类（涨跌幅/量比/换手率/PB）放大 100 倍，如 112 -> 1.12、-294 -> -2.94%
-    """
-    data = _fetch_em_hk_single_quote(code)
-    if not data:
-        return None
-
-    raw_price = data.get("f43")
-    if not isinstance(raw_price, (int, float)) or raw_price <= 0:
-        return None
-
-    def _price(key):
-        val = data.get(key)
-        if isinstance(val, (int, float)) and val > 0:
-            out = round(float(val) / 1000.0, 3)
-            return out if 0 < out < 100000 else None
-        return None
-
-    def _signed_price(key):
-        val = data.get(key)
-        if isinstance(val, (int, float)):
-            return round(float(val) / 1000.0, 3)
-        return None
-
-    def _ratio(key):
-        val = data.get(key)
-        if isinstance(val, (int, float)):
-            return round(float(val) / 100.0, 2)
-        return None
-
-    quote = UnifiedRealtimeQuote(
-        code=stock_code,
-        name=str(data.get("f58") or ""),
-        source=RealtimeSource.AKSHARE_EM,
-        price=_price("f43"),
-        change_pct=_ratio("f170"),
-        change_amount=_signed_price("f169"),
-        open_price=_price("f46"),
-        high=_price("f44"),
-        low=_price("f45"),
-        pre_close=_price("f60"),
-        volume=safe_int(data.get("f47")),
-        amount=safe_float(data.get("f48")),
-        volume_ratio=_ratio("f50"),
-        turnover_rate=_ratio("f168"),
-        pb_ratio=_ratio("f167"),
-    )
-    if quote.price is None:
-        return None
-
-    if quote.amplitude is None and quote.high and quote.low and quote.pre_close:
-        try:
-            quote.amplitude = round((quote.high - quote.low) / quote.pre_close * 100, 2)
-        except ZeroDivisionError:
-            pass
-    return quote
-
-
-def _fill_hk_quote_gaps(quote: "UnifiedRealtimeQuote", code: str) -> None:
-    """就地补齐港股实时行情的缺失字段：量比、换手率、PB，振幅用高低价推算。
-
-    akshare 的 stock_hk_spot_em() 只返回 12 列
-    （序号/代码/名称/最新价/涨跌额/涨跌幅/今开/最高/最低/昨收/成交量/成交额），
-    量比与换手率需另取东财单股接口。
-    """
-    # 振幅：优先用已有高低价与昨收直接计算，不依赖外部接口
-    if quote.amplitude is None and quote.high and quote.low and quote.pre_close:
-        try:
-            quote.amplitude = round((quote.high - quote.low) / quote.pre_close * 100, 2)
-        except ZeroDivisionError:
-            pass
-
-    if quote.volume_ratio is not None and quote.turnover_rate is not None:
-        return  # 已齐全，不必额外请求
-
-    data = _fetch_em_hk_single_quote(code)
-    if not data:
-        return
-
-    # 东财比率类字段（量比/换手率/PB）统一放大 100 倍，与价格类（放大 1000）不同
-    SCALE = 100.0
-
-    def _num(key):
-        val = data.get(key)
-        if isinstance(val, (int, float)):
-            return float(val) / SCALE
-        return None
-
-    if quote.volume_ratio is None:
-        val = _num("f50")
-        if val is not None and 0 < val < 100:
-            quote.volume_ratio = round(val, 2)
-
-    if quote.turnover_rate is None:
-        val = _num("f168")
-        if val is not None and 0 <= val <= 100:
-            quote.turnover_rate = round(val, 2)
-
-    if quote.pb_ratio is None:
-        val = _num("f167")
-        if val is not None and 0 < val < 1000:
-            quote.pb_ratio = round(val, 2)
-
-
     def _get_hk_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取港股实时行情数据
@@ -2772,3 +2636,139 @@ if __name__ == "__main__":
             print("未获取到行业板块排名数据")
     except Exception as e:
         print(f"[行业板块排名] 获取失败: {e}")
+
+
+def _fetch_em_hk_single_quote(code: str) -> dict:
+    """东方财富单股接口：补齐 ak.stock_hk_spot_em() 不返回的量比/换手率/PE/PB。
+
+    该接口返回的数值可能是放大 100 倍后的整数（如 30.38 -> 30380），
+    调用方需用最新价自校准缩放系数，不可假定固定倍数。
+    """
+    try:
+        resp = requests.get(
+            "https://push2.eastmoney.com/api/qt/stock/get",
+            params={
+                "secid": f"116.{code}",
+                "fields": "f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f162,f167,f168,f169,f170",
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "invt": "2",
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+    except Exception as exc:  # 网络失败不应影响主流程
+        logger.debug(f"[港股补充行情] {code} 获取失败: {exc}")
+        return {}
+
+
+def _build_quote_from_em_single(stock_code: str, code: str) -> Optional["UnifiedRealtimeQuote"]:
+    """用东方财富单股接口构造港股实时行情（单票 1 次请求，毫秒级）。
+
+    相比 ak.stock_hk_spot_em()（需拉全市场约 4743 只、实测耗时 127s 易超时），
+    该接口一次只取一只，是港股实时行情更合适的首选源。
+
+    字段单位（东财港股）：
+      - 价格类（最新/开/高/低/昨收/涨跌额）放大 1000 倍，如 30380 -> 30.38
+      - 比率类（涨跌幅/量比/换手率/PB）放大 100 倍，如 112 -> 1.12、-294 -> -2.94%
+    """
+    data = _fetch_em_hk_single_quote(code)
+    if not data:
+        return None
+
+    raw_price = data.get("f43")
+    if not isinstance(raw_price, (int, float)) or raw_price <= 0:
+        return None
+
+    def _price(key):
+        val = data.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            out = round(float(val) / 1000.0, 3)
+            return out if 0 < out < 100000 else None
+        return None
+
+    def _signed_price(key):
+        val = data.get(key)
+        if isinstance(val, (int, float)):
+            return round(float(val) / 1000.0, 3)
+        return None
+
+    def _ratio(key):
+        val = data.get(key)
+        if isinstance(val, (int, float)):
+            return round(float(val) / 100.0, 2)
+        return None
+
+    quote = UnifiedRealtimeQuote(
+        code=stock_code,
+        name=str(data.get("f58") or ""),
+        source=RealtimeSource.AKSHARE_EM,
+        price=_price("f43"),
+        change_pct=_ratio("f170"),
+        change_amount=_signed_price("f169"),
+        open_price=_price("f46"),
+        high=_price("f44"),
+        low=_price("f45"),
+        pre_close=_price("f60"),
+        volume=safe_int(data.get("f47")),
+        amount=safe_float(data.get("f48")),
+        volume_ratio=_ratio("f50"),
+        turnover_rate=_ratio("f168"),
+        pb_ratio=_ratio("f167"),
+    )
+    if quote.price is None:
+        return None
+
+    if quote.amplitude is None and quote.high and quote.low and quote.pre_close:
+        try:
+            quote.amplitude = round((quote.high - quote.low) / quote.pre_close * 100, 2)
+        except ZeroDivisionError:
+            pass
+    return quote
+
+
+def _fill_hk_quote_gaps(quote: "UnifiedRealtimeQuote", code: str) -> None:
+    """就地补齐港股实时行情的缺失字段：量比、换手率、PB，振幅用高低价推算。
+
+    akshare 的 stock_hk_spot_em() 只返回 12 列
+    （序号/代码/名称/最新价/涨跌额/涨跌幅/今开/最高/最低/昨收/成交量/成交额），
+    量比与换手率需另取东财单股接口。
+    """
+    # 振幅：优先用已有高低价与昨收直接计算，不依赖外部接口
+    if quote.amplitude is None and quote.high and quote.low and quote.pre_close:
+        try:
+            quote.amplitude = round((quote.high - quote.low) / quote.pre_close * 100, 2)
+        except ZeroDivisionError:
+            pass
+
+    if quote.volume_ratio is not None and quote.turnover_rate is not None:
+        return  # 已齐全，不必额外请求
+
+    data = _fetch_em_hk_single_quote(code)
+    if not data:
+        return
+
+    # 东财比率类字段（量比/换手率/PB）统一放大 100 倍，与价格类（放大 1000）不同
+    SCALE = 100.0
+
+    def _num(key):
+        val = data.get(key)
+        if isinstance(val, (int, float)):
+            return float(val) / SCALE
+        return None
+
+    if quote.volume_ratio is None:
+        val = _num("f50")
+        if val is not None and 0 < val < 100:
+            quote.volume_ratio = round(val, 2)
+
+    if quote.turnover_rate is None:
+        val = _num("f168")
+        if val is not None and 0 <= val <= 100:
+            quote.turnover_rate = round(val, 2)
+
+    if quote.pb_ratio is None:
+        val = _num("f167")
+        if val is not None and 0 < val < 1000:
+            quote.pb_ratio = round(val, 2)
