@@ -1795,8 +1795,16 @@ def _fill_hk_quote_gaps(quote: "UnifiedRealtimeQuote", code: str) -> None:
                     f"振幅={quick_quote.amplitude}%"
                 )
                 return quick_quote
+            logger.warning(
+                f"[港股实时行情] {stock_code} 东财单股接口未返回有效数据，"
+                f"按配置跳过批量接口（stock_hk_spot_em 需拉全市场约 4743 只、字段更少）"
+            )
         except Exception as exc:
-            logger.debug(f"[港股实时行情] {stock_code} 单股接口不可用，回退批量接口: {exc}")
+            logger.warning(f"[港股实时行情] {stock_code} 东财单股接口异常: {exc}")
+        # 按要求：不再回退 ak.stock_hk_spot_em()。该接口需拉全市场（实测 127s）
+        # 且只返回 12 个基础字段（含量比/换手率缺失），作为兜底性价比极低，
+        # 失败时直接让上层回退到后面的数据源（如 yfinance）。
+        return None
 
         def build_em_quote(df: pd.DataFrame) -> Optional[UnifiedRealtimeQuote]:
             if df.empty:
