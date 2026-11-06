@@ -1629,7 +1629,7 @@ def _fetch_em_hk_single_quote(code: str) -> dict:
             "https://push2.eastmoney.com/api/qt/stock/get",
             params={
                 "secid": f"116.{code}",
-                "fields": "f43,f44,f45,f46,f50,f60,f162,f167,f168",
+                "fields": "f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f162,f167,f168,f169,f170",
                 "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                 "invt": "2",
             },
@@ -1641,6 +1641,71 @@ def _fetch_em_hk_single_quote(code: str) -> dict:
     except Exception as exc:  # 网络失败不应影响主流程
         logger.debug(f"[港股补充行情] {code} 获取失败: {exc}")
         return {}
+
+
+def _build_quote_from_em_single(stock_code: str, code: str) -> Optional["UnifiedRealtimeQuote"]:
+    """用东方财富单股接口构造港股实时行情（单票 1 次请求，毫秒级）。
+
+    相比 ak.stock_hk_spot_em()（需拉全市场约 4743 只、实测耗时 127s 易超时），
+    该接口一次只取一只，是港股实时行情更合适的首选源。
+
+    字段单位（东财港股）：
+      - 价格类（最新/开/高/低/昨收/涨跌额）放大 1000 倍，如 30380 -> 30.38
+      - 比率类（涨跌幅/量比/换手率/PB）放大 100 倍，如 112 -> 1.12、-294 -> -2.94%
+    """
+    data = _fetch_em_hk_single_quote(code)
+    if not data:
+        return None
+
+    raw_price = data.get("f43")
+    if not isinstance(raw_price, (int, float)) or raw_price <= 0:
+        return None
+
+    def _price(key):
+        val = data.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            out = round(float(val) / 1000.0, 3)
+            return out if 0 < out < 100000 else None
+        return None
+
+    def _signed_price(key):
+        val = data.get(key)
+        if isinstance(val, (int, float)):
+            return round(float(val) / 1000.0, 3)
+        return None
+
+    def _ratio(key):
+        val = data.get(key)
+        if isinstance(val, (int, float)):
+            return round(float(val) / 100.0, 2)
+        return None
+
+    quote = UnifiedRealtimeQuote(
+        code=stock_code,
+        name=str(data.get("f58") or ""),
+        source=RealtimeSource.AKSHARE_EM,
+        price=_price("f43"),
+        change_pct=_ratio("f170"),
+        change_amount=_signed_price("f169"),
+        open_price=_price("f46"),
+        high=_price("f44"),
+        low=_price("f45"),
+        pre_close=_price("f60"),
+        volume=safe_int(data.get("f47")),
+        amount=safe_float(data.get("f48")),
+        volume_ratio=_ratio("f50"),
+        turnover_rate=_ratio("f168"),
+        pb_ratio=_ratio("f167"),
+    )
+    if quote.price is None:
+        return None
+
+    if quote.amplitude is None and quote.high and quote.low and quote.pre_close:
+        try:
+            quote.amplitude = round((quote.high - quote.low) / quote.pre_close * 100, 2)
+        except ZeroDivisionError:
+            pass
+    return quote
 
 
 def _fill_hk_quote_gaps(quote: "UnifiedRealtimeQuote", code: str) -> None:
@@ -1664,17 +1729,13 @@ def _fill_hk_quote_gaps(quote: "UnifiedRealtimeQuote", code: str) -> None:
     if not data:
         return
 
-    # 自校准缩放：用最新价与 quote.price 比对，判断接口是放大 100 倍还是已格式化
-    scale = 100.0
-    raw_price = data.get("f43")
-    if isinstance(raw_price, (int, float)) and quote.price:
-        if abs(float(raw_price) - quote.price) < abs(float(raw_price) / 100.0 - quote.price):
-            scale = 1.0
+    # 东财比率类字段（量比/换手率/PB）统一放大 100 倍，与价格类（放大 1000）不同
+    SCALE = 100.0
 
     def _num(key):
         val = data.get(key)
         if isinstance(val, (int, float)):
-            return float(val) / scale
+            return float(val) / SCALE
         return None
 
     if quote.volume_ratio is None:
@@ -1719,6 +1780,23 @@ def _fill_hk_quote_gaps(quote: "UnifiedRealtimeQuote", code: str) -> None:
         if raw_code.startswith('hk'):
             raw_code = raw_code[2:]
         code = raw_code.zfill(5)
+
+        # 快速路径：东财单股接口（单票 1 次请求）。批量接口 stock_hk_spot_em
+        # 需拉全市场约 4743 只、实测 127s，在 CI 里极易超时被跳过，
+        # 一旦跳过就会退到 yfinance（无量比/换手率、昨收可能取错），故优先走单股接口。
+        try:
+            quick_quote = _build_quote_from_em_single(stock_code, code)
+            if quick_quote is not None:
+                logger.info(
+                    f"[港股实时行情] {stock_code} 东财单股接口成功: 价格={quick_quote.price}, "
+                    f"昨收={quick_quote.pre_close}, 开={quick_quote.open_price}, "
+                    f"高={quick_quote.high}, 低={quick_quote.low}, "
+                    f"量比={quick_quote.volume_ratio}, 换手率={quick_quote.turnover_rate}%, "
+                    f"振幅={quick_quote.amplitude}%"
+                )
+                return quick_quote
+        except Exception as exc:
+            logger.debug(f"[港股实时行情] {stock_code} 单股接口不可用，回退批量接口: {exc}")
 
         def build_em_quote(df: pd.DataFrame) -> Optional[UnifiedRealtimeQuote]:
             if df.empty:
