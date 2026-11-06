@@ -5157,6 +5157,23 @@ Output the complete Decision Dashboard in JSON format."""
         close = today.get('close')
         high = today.get('high')
         low = today.get('low')
+        pct_chg = today.get('pct_chg')
+
+        # 昨收校验：日线可能缺前一日（港股节假日/数据源缺口），此时 yesterday.close
+        # 会退到更早的交易日，导致昨收、涨跌额与涨跌幅互相矛盾。
+        # 用「收盘价 / (1 + 涨跌幅)」反推真实昨收，与日线值偏差超过 1% 时以反推值为准。
+        if close is not None and pct_chg is not None:
+            try:
+                derived_prev = float(close) / (1 + float(pct_chg) / 100.0)
+                if derived_prev > 0:
+                    if prev_close in (None, 0):
+                        prev_close = round(derived_prev, 3)
+                    else:
+                        drift = abs(float(prev_close) - derived_prev) / derived_prev
+                        if drift > 0.01:
+                            prev_close = round(derived_prev, 3)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
 
         amplitude = None
         change_amount = None
