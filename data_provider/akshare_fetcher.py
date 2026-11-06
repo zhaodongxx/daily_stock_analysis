@@ -1618,6 +1618,81 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, str(e))
             return None
     
+def _fetch_em_hk_single_quote(code: str) -> dict:
+    """东方财富单股接口：补齐 ak.stock_hk_spot_em() 不返回的量比/换手率/PE/PB。
+
+    该接口返回的数值可能是放大 100 倍后的整数（如 30.38 -> 30380），
+    调用方需用最新价自校准缩放系数，不可假定固定倍数。
+    """
+    try:
+        resp = requests.get(
+            "https://push2.eastmoney.com/api/qt/stock/get",
+            params={
+                "secid": f"116.{code}",
+                "fields": "f43,f44,f45,f46,f50,f60,f162,f167,f168",
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "invt": "2",
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+    except Exception as exc:  # 网络失败不应影响主流程
+        logger.debug(f"[港股补充行情] {code} 获取失败: {exc}")
+        return {}
+
+
+def _fill_hk_quote_gaps(quote: "UnifiedRealtimeQuote", code: str) -> None:
+    """就地补齐港股实时行情的缺失字段：量比、换手率、PB，振幅用高低价推算。
+
+    akshare 的 stock_hk_spot_em() 只返回 12 列
+    （序号/代码/名称/最新价/涨跌额/涨跌幅/今开/最高/最低/昨收/成交量/成交额），
+    量比与换手率需另取东财单股接口。
+    """
+    # 振幅：优先用已有高低价与昨收直接计算，不依赖外部接口
+    if quote.amplitude is None and quote.high and quote.low and quote.pre_close:
+        try:
+            quote.amplitude = round((quote.high - quote.low) / quote.pre_close * 100, 2)
+        except ZeroDivisionError:
+            pass
+
+    if quote.volume_ratio is not None and quote.turnover_rate is not None:
+        return  # 已齐全，不必额外请求
+
+    data = _fetch_em_hk_single_quote(code)
+    if not data:
+        return
+
+    # 自校准缩放：用最新价与 quote.price 比对，判断接口是放大 100 倍还是已格式化
+    scale = 100.0
+    raw_price = data.get("f43")
+    if isinstance(raw_price, (int, float)) and quote.price:
+        if abs(float(raw_price) - quote.price) < abs(float(raw_price) / 100.0 - quote.price):
+            scale = 1.0
+
+    def _num(key):
+        val = data.get(key)
+        if isinstance(val, (int, float)):
+            return float(val) / scale
+        return None
+
+    if quote.volume_ratio is None:
+        val = _num("f50")
+        if val is not None and 0 < val < 100:
+            quote.volume_ratio = round(val, 2)
+
+    if quote.turnover_rate is None:
+        val = _num("f168")
+        if val is not None and 0 <= val <= 100:
+            quote.turnover_rate = round(val, 2)
+
+    if quote.pb_ratio is None:
+        val = _num("f167")
+        if val is not None and 0 < val < 1000:
+            quote.pb_ratio = round(val, 2)
+
+
     def _get_hk_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取港股实时行情数据
@@ -1668,16 +1743,27 @@ class AkshareFetcher(BaseFetcher):
                 volume_ratio=safe_float(row.get('量比')),
                 turnover_rate=safe_float(row.get('换手率')),
                 amplitude=safe_float(row.get('振幅')),
-                pe_ratio=safe_float(row.get('市盈率')),
+                open_price=safe_float(row.get('今开')),
+                high=safe_float(row.get('最高')),
+                low=safe_float(row.get('最低')),
+                pre_close=safe_float(row.get('昨收')),
+                pe_ratio=safe_float(row.get('市盈率')) or safe_float(row.get('市盈率-动态')),
                 pb_ratio=safe_float(row.get('市净率')),
                 total_mv=safe_float(row.get('总市值')),
                 circ_mv=safe_float(row.get('流通市值')),
                 high_52w=safe_float(row.get('52周最高')),
                 low_52w=safe_float(row.get('52周最低')),
             )
+            try:
+                _fill_hk_quote_gaps(quote, code)
+            except Exception as exc:
+                logger.debug(f"[港股实时行情] {stock_code} 字段补齐失败: {exc}")
+
             logger.info(
                 f"[港股实时行情] {stock_code} {quote.name}: 价格={quote.price}, "
-                f"涨跌={quote.change_pct}%, 换手率={quote.turnover_rate}%"
+                f"涨跌={quote.change_pct}%, 开={quote.open_price}, 高={quote.high}, "
+                f"低={quote.low}, 昨收={quote.pre_close}, 量比={quote.volume_ratio}, "
+                f"换手率={quote.turnover_rate}%, 振幅={quote.amplitude}%"
             )
             return quote
 
